@@ -68,4 +68,5 @@ jobs:
           git config user.email "bot@github.com"
           git add data/preise.json
           git diff --staged --quiet || git commit -m "Preise $(date +'%Y-%m-%d')"
+          git pull --rebase origin main
           git push
