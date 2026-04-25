@@ -123,10 +123,10 @@
 <script>
   // KONFIGURATION — GitHub Raw URL zur preise.json
   // Format: https://raw.githubusercontent.com/DEIN-USERNAME/REPO-NAME/main/data/preise.json
-  const DATA_URL = 'https://raw.githubusercontent.com/ron2507-lab/Strompreis/refs/heads/main/data/preise.json';
+  const DATA_URL = 'https://raw.githubusercontent.com/ron2507-lab/Strompreis-Vater/refs/heads/main/data/preise.json';
 
   // Aufschlag für Brutto-Berechnung (wie in Ladeampel)
-  const AUFSCHLAG = 13.49;
+  const AUFSCHLAG = 17.42;
   const total = raw => Math.round((raw + AUFSCHLAG) * 1.19 * 10) / 10;
 
   let db = {};         // alle historischen Daten
