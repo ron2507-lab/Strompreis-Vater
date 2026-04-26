@@ -1,0 +1,5 @@
+{
+  "titel": "Strompreise",
+  "dataUrl": "https://raw.githubusercontent.com/ron2507-lab/Strompreis-Vater/refs/heads/main/data/preise.json",
+  "aufschlag": 17.42
+}
