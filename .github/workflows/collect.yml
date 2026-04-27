@@ -17,32 +17,26 @@ jobs:
 
       - name: Preise abrufen und speichern
         run: |
+          git pull --rebase origin main
           python3 << 'EOF'
           import json, urllib.request, os
           from datetime import datetime, timezone, timedelta
 
-          # Heute und Morgen in MEZ
-          mez = timezone(timedelta(hours=2))  # MESZ im Sommer
-          now = datetime.now(mez)
-          today    = now.strftime('%Y-%m-%d')
-          tomorrow = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+          mez = timezone(timedelta(hours=2))
 
           # aWATTar API abrufen
           url = 'https://api.awattar.de/v1/marketdata'
           with urllib.request.urlopen(url) as r:
               data = json.loads(r.read())
 
-          # Alle Stunden nach Datum gruppieren
+          # Alle Stunden aus der API nach Tag gruppieren
           by_day = {}
           for entry in data['data']:
               dt = datetime.fromtimestamp(entry['start_timestamp'] / 1000, tz=mez)
-              day = dt.strftime('%Y-%m-%d')
-              if day not in by_day:
-                  by_day[day] = []
-              by_day[day].append({
-                  'hour': dt.hour,
-                  'raw': round(entry['marketprice'] / 10, 3)
-              })
+              day_str = dt.strftime('%Y-%m-%d')
+              if day_str not in by_day:
+                  by_day[day_str] = {}
+              by_day[day_str][dt.hour] = round(entry['marketprice'] / 10, 3)
 
           # Bestehende Datei laden oder neu erstellen
           path = 'data/preise.json'
@@ -53,18 +47,17 @@ jobs:
           else:
               db = {}
 
-          # Heute UND Morgen speichern (falls in API vorhanden)
-          for day in [today, tomorrow]:
-              if day in by_day:
-                  hours = sorted(by_day[day], key=lambda x: x['hour'])
-                  db[day] = hours
-                  print(f"✓ {day}: {len(hours)} Stunden gespeichert")
-              else:
-                  print(f"– {day}: keine Daten in API")
+          # Stunden mergen (nicht überschreiben)
+          for day_str, new_hours in by_day.items():
+              existing = {h['hour']: h['raw'] for h in db.get(day_str, [])}
+              existing.update(new_hours)  # neue Werte überschreiben alte
+              db[day_str] = [{'hour': h, 'raw': existing[h]} for h in sorted(existing)]
+              print(f"✓ {day_str}: {len(db[day_str])} Stunden gespeichert")
 
           # Speichern
           with open(path, 'w') as f:
               json.dump(db, f, separators=(',', ':'))
+
           EOF
 
       - name: Daten committen
@@ -73,5 +66,4 @@ jobs:
           git config user.email "bot@github.com"
           git add data/preise.json
           git diff --staged --quiet || git commit -m "Preise $(date +'%Y-%m-%d')"
-          git pull --rebase origin main
           git push
