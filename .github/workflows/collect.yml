@@ -15,30 +15,100 @@ jobs:
       - name: Repository auschecken
         uses: actions/checkout@v4
 
+      - name: Aktuellen Stand holen
+        run: git pull --rebase origin main
+
       - name: Preise abrufen und speichern
+        env:
+          WORKER_URL: ${{ secrets.ENTSOE_WORKER_URL }}
         run: |
-          git pull --rebase origin main
           python3 << 'EOF'
-          import json, urllib.request, os
+          import json, urllib.request, os, sys
           from datetime import datetime, timezone, timedelta
+          from xml.etree import ElementTree as ET
 
-          mez = timezone(timedelta(hours=2))
+          # ── Zeitzone ──────────────────────────────────────────────────────────
+          mez = timezone(timedelta(hours=2))   # MESZ (Sommer); MEZ wäre +1
+          now = datetime.now(mez)
+          today     = now.strftime('%Y-%m-%d')
+          tomorrow  = (now + timedelta(days=1)).strftime('%Y-%m-%d')
 
-          # aWATTar API abrufen
-          url = 'https://api.awattar.de/v1/marketdata'
-          with urllib.request.urlopen(url) as r:
-              data = json.loads(r.read())
+          # ENTSO-E erwartet UTC-Zeitstempel ohne Trennzeichen: YYYYMMDDHHMM
+          utc = timezone.utc
+          # Abfragebereich: gestern 22:00 UTC → übermorgen 22:00 UTC  (deckt heute+morgen MESZ ab)
+          start_utc = (now.replace(hour=0, minute=0, second=0, microsecond=0)
+                       .astimezone(utc) - timedelta(hours=2))
+          end_utc   = start_utc + timedelta(hours=72)
+          period_start = start_utc.strftime('%Y%m%d%H%M')
+          period_end   = end_utc.strftime('%Y%m%d%H%M')
 
-          # Alle Stunden aus der API nach Tag gruppieren
-          by_day = {}
-          for entry in data['data']:
-              dt = datetime.fromtimestamp(entry['start_timestamp'] / 1000, tz=mez)
-              day_str = dt.strftime('%Y-%m-%d')
-              if day_str not in by_day:
-                  by_day[day_str] = {}
-              by_day[day_str][dt.hour] = round(entry['marketprice'] / 10, 3)
+          # ── ENTSO-E via Cloudflare Worker ────────────────────────────────────
+          worker_url = os.environ.get('WORKER_URL', '').strip()
+          slots_by_day = {}   # YYYY-MM-DD -> list of {hour, minute, raw}
+          source = 'unbekannt'
 
-          # Bestehende Datei laden oder neu erstellen
+          if worker_url:
+              url = f"{worker_url}?periodStart={period_start}&periodEnd={period_end}"
+              try:
+                  req = urllib.request.Request(url, headers={'User-Agent': 'strompreis-bot/1.0'})
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      xml_text = r.read().decode('utf-8')
+
+                  # XML parsen — Namespace dynamisch aus Root-Element lesen
+                  root = ET.fromstring(xml_text)
+                  ns_uri = root.tag.split('}')[0].lstrip('{') if '}' in root.tag else 'urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3'
+                  ns = {'ns': ns_uri}
+
+                  for ts in root.findall('.//ns:TimeSeries', ns):
+                      resolution = ts.findtext('.//ns:resolution', namespaces=ns) or 'PT60M'
+                      step_min = 15 if resolution == 'PT15M' else 60
+                      interval = ts.find('.//ns:timeInterval', ns)
+                      if interval is None:
+                          continue
+                      start_str = interval.findtext('ns:start', namespaces=ns)
+                      # Parse UTC start: "2026-04-27T22:00Z"
+                      start_dt = datetime.strptime(start_str, '%Y-%m-%dT%H:%MZ').replace(tzinfo=utc)
+
+                      for pt in ts.findall('.//ns:Point', ns):
+                          pos = int(pt.findtext('ns:position', namespaces=ns))
+                          price_mwh = float(pt.findtext('ns:price.amount', namespaces=ns))
+                          slot_utc = start_dt + timedelta(minutes=(pos - 1) * step_min)
+                          slot_mez = slot_utc.astimezone(mez)
+                          day_str = slot_mez.strftime('%Y-%m-%d')
+                          if day_str not in slots_by_day:
+                              slots_by_day[day_str] = {}
+                          key = (slot_mez.hour, slot_mez.minute)
+                          slots_by_day[day_str][key] = round(price_mwh / 10, 3)   # EUR/MWh → ct/kWh netto
+
+                  source = 'ENTSO-E (15-Min)'
+                  print(f"✓ ENTSO-E: {sum(len(v) for v in slots_by_day.values())} Slots geladen")
+
+              except Exception as e:
+                  print(f"⚠ ENTSO-E fehlgeschlagen: {e} — nutze aWATTar Fallback", file=sys.stderr)
+                  slots_by_day = {}
+          else:
+              print("⚠ WORKER_URL nicht gesetzt — nutze aWATTar Fallback", file=sys.stderr)
+
+          # ── aWATTar Fallback (stündlich → als :00-Slot speichern) ────────────
+          if not slots_by_day:
+              awattar_url = 'https://api.awattar.de/v1/marketdata'
+              try:
+                  with urllib.request.urlopen(awattar_url, timeout=15) as r:
+                      data = json.loads(r.read())
+                  for entry in data['data']:
+                      dt = datetime.fromtimestamp(entry['start_timestamp'] / 1000, tz=mez)
+                      day_str = dt.strftime('%Y-%m-%d')
+                      if day_str not in slots_by_day:
+                          slots_by_day[day_str] = {}
+                      key = (dt.hour, 0)
+                      slots_by_day[day_str][key] = round(entry['marketprice'] / 10, 3)
+                  source = 'aWATTar (stündlich)'
+                  print(f"✓ aWATTar Fallback: {sum(len(v) for v in slots_by_day.values())} Slots geladen")
+              except Exception as e:
+                  print(f"✗ aWATTar ebenfalls fehlgeschlagen: {e}", file=sys.stderr)
+                  sys.exit(1)
+
+          # ── Bestehende Datei laden ────────────────────────────────────────────
           path = 'data/preise.json'
           os.makedirs('data', exist_ok=True)
           if os.path.exists(path):
@@ -47,17 +117,28 @@ jobs:
           else:
               db = {}
 
-          # Stunden mergen (nicht überschreiben)
-          for day_str, new_hours in by_day.items():
-              existing = {h['hour']: h['raw'] for h in db.get(day_str, [])}
-              existing.update(new_hours)  # neue Werte überschreiben alte
-              db[day_str] = [{'hour': h, 'raw': existing[h]} for h in sorted(existing)]
-              print(f"✓ {day_str}: {len(db[day_str])} Stunden gespeichert")
+          # ── Mergen: neue Slots ergänzen, vorhandene NICHT überschreiben ───────
+          for day_str, new_slots in slots_by_day.items():
+              if day_str not in [today, tomorrow]:
+                  continue  # nur heute und morgen speichern
+              existing = {}
+              for slot in db.get(day_str, []):
+                  existing[(slot['hour'], slot.get('minute', 0))] = slot['raw']
+              # Neue Werte hinzufügen (vorhandene behalten)
+              existing.update(new_slots)
+              # Sortiert als Liste speichern
+              db[day_str] = sorted(
+                  [{'hour': h, 'minute': m, 'raw': r} for (h, m), r in existing.items()],
+                  key=lambda x: (x['hour'], x['minute'])
+              )
 
-          # Speichern
+          # ── Speichern ─────────────────────────────────────────────────────────
           with open(path, 'w') as f:
               json.dump(db, f, separators=(',', ':'))
 
+          for day_str in [today, tomorrow]:
+              if day_str in db:
+                  print(f"✓ {day_str}: {len(db[day_str])} Slots gespeichert ({source})")
           EOF
 
       - name: Daten committen
