@@ -23,7 +23,7 @@ jobs:
           WORKER_URL: ${{ secrets.ENTSOE_WORKER_URL }}
         run: |
           python3 << 'EOF'
-          import json, urllib.request, os, sys
+          import json, urllib.request, os, sys, time
           from datetime import datetime, timezone, timedelta
           from xml.etree import ElementTree as ET
 
@@ -42,50 +42,59 @@ jobs:
           period_start = start_utc.strftime('%Y%m%d%H%M')
           period_end   = end_utc.strftime('%Y%m%d%H%M')
 
-          # ── ENTSO-E via Cloudflare Worker ────────────────────────────────────
+          # ── ENTSO-E via Cloudflare Worker (3 Versuche, 30s Pause) ────────────
           worker_url = os.environ.get('WORKER_URL', '').strip()
           slots_by_day = {}   # YYYY-MM-DD -> list of {hour, minute, raw}
           source = 'unbekannt'
 
           if worker_url:
               url = f"{worker_url}?periodStart={period_start}&periodEnd={period_end}"
-              try:
-                  req = urllib.request.Request(url, headers={'User-Agent': 'strompreis-bot/1.0'})
-                  with urllib.request.urlopen(req, timeout=20) as r:
-                      xml_text = r.read().decode('utf-8')
+              last_err = None
+              for attempt in range(1, 4):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent': 'strompreis-bot/1.0'})
+                      with urllib.request.urlopen(req, timeout=20) as r:
+                          xml_text = r.read().decode('utf-8')
 
-                  # XML parsen — Namespace dynamisch aus Root-Element lesen
-                  root = ET.fromstring(xml_text)
-                  ns_uri = root.tag.split('}')[0].lstrip('{') if '}' in root.tag else 'urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3'
-                  ns = {'ns': ns_uri}
+                      # XML parsen — Namespace dynamisch aus Root-Element lesen
+                      root = ET.fromstring(xml_text)
+                      ns_uri = root.tag.split('}')[0].lstrip('{') if '}' in root.tag else 'urn:iec62325.351:tc57wg16:451-3:publicationdocument:7:3'
+                      ns = {'ns': ns_uri}
 
-                  for ts in root.findall('.//ns:TimeSeries', ns):
-                      resolution = ts.findtext('.//ns:resolution', namespaces=ns) or 'PT60M'
-                      step_min = 15 if resolution == 'PT15M' else 60
-                      interval = ts.find('.//ns:timeInterval', ns)
-                      if interval is None:
-                          continue
-                      start_str = interval.findtext('ns:start', namespaces=ns)
-                      # Parse UTC start: "2026-04-27T22:00Z"
-                      start_dt = datetime.strptime(start_str, '%Y-%m-%dT%H:%MZ').replace(tzinfo=utc)
+                      for ts in root.findall('.//ns:TimeSeries', ns):
+                          resolution = ts.findtext('.//ns:resolution', namespaces=ns) or 'PT60M'
+                          step_min = 15 if resolution == 'PT15M' else 60
+                          interval = ts.find('.//ns:timeInterval', ns)
+                          if interval is None:
+                              continue
+                          start_str = interval.findtext('ns:start', namespaces=ns)
+                          # Parse UTC start: "2026-04-27T22:00Z"
+                          start_dt = datetime.strptime(start_str, '%Y-%m-%dT%H:%MZ').replace(tzinfo=utc)
 
-                      for pt in ts.findall('.//ns:Point', ns):
-                          pos = int(pt.findtext('ns:position', namespaces=ns))
-                          price_mwh = float(pt.findtext('ns:price.amount', namespaces=ns))
-                          slot_utc = start_dt + timedelta(minutes=(pos - 1) * step_min)
-                          slot_mez = slot_utc.astimezone(mez)
-                          day_str = slot_mez.strftime('%Y-%m-%d')
-                          if day_str not in slots_by_day:
-                              slots_by_day[day_str] = {}
-                          key = (slot_mez.hour, slot_mez.minute)
-                          slots_by_day[day_str][key] = round(price_mwh / 10, 3)   # EUR/MWh → ct/kWh netto
+                          for pt in ts.findall('.//ns:Point', ns):
+                              pos = int(pt.findtext('ns:position', namespaces=ns))
+                              price_mwh = float(pt.findtext('ns:price.amount', namespaces=ns))
+                              slot_utc = start_dt + timedelta(minutes=(pos - 1) * step_min)
+                              slot_mez = slot_utc.astimezone(mez)
+                              day_str = slot_mez.strftime('%Y-%m-%d')
+                              if day_str not in slots_by_day:
+                                  slots_by_day[day_str] = {}
+                              key = (slot_mez.hour, slot_mez.minute)
+                              slots_by_day[day_str][key] = round(price_mwh / 10, 3)   # EUR/MWh → ct/kWh netto
 
-                  source = 'ENTSO-E (15-Min)'
-                  print(f"✓ ENTSO-E: {sum(len(v) for v in slots_by_day.values())} Slots geladen")
+                      source = 'ENTSO-E (15-Min)'
+                      print(f"✓ ENTSO-E: {sum(len(v) for v in slots_by_day.values())} Slots geladen (Versuch {attempt})")
+                      last_err = None
+                      break  # Erfolg — Schleife beenden
 
-              except Exception as e:
-                  print(f"⚠ ENTSO-E fehlgeschlagen: {e} — nutze aWATTar Fallback", file=sys.stderr)
-                  slots_by_day = {}
+                  except Exception as e:
+                      last_err = e
+                      slots_by_day = {}
+                      if attempt < 3:
+                          print(f"⚠ ENTSO-E Versuch {attempt} fehlgeschlagen: {e} — warte 30s", file=sys.stderr)
+                          time.sleep(30)
+                      else:
+                          print(f"⚠ ENTSO-E nach 3 Versuchen fehlgeschlagen: {e} — nutze aWATTar Fallback", file=sys.stderr)
           else:
               print("⚠ WORKER_URL nicht gesetzt — nutze aWATTar Fallback", file=sys.stderr)
 
